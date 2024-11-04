@@ -106,23 +106,79 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/materialize/1.0.0/js/materialize.min.js"></script>
 
     <script>
-        let deviceStates = {};
-        const peerConnection = new RTCPeerConnection({
-            iceServers: [
-                {
-                    urls: "stun:stun.cloudflare.com:3478"
+        const socket = new WebSocket("/ws")
+        let peerConnection;
+        socket.onopen = async () => {
+            console.log("Connected to signaling server")
+
+            peerConnection = new RTCPeerConnection({
+                iceServers: [
+                    {
+                        urls: "stun:stun.cloudflare.com:3478"
+                    }
+                ]
+            });
+            peerConnection.onicecandidate = event => {
+                console.log(`Ice Candidate: ${JSON.stringify(event.candidate)}`)
+                if (event.candidate) {
+                    socket.send(JSON.stringify({
+                        type: "candidate",
+                        candidate: event.candidate
+                    }))
                 }
-            ]
-        });
-        const dataChannel = peerConnection.createDataChannel("control")
+            }
+            peerConnection.oniceconnectionstatechange = event => {
+                console.log(event)
+            }
 
-        dataChannel.onopen = () => {
-            console.log("Data channel is open!");
-        };
+            peerConnection.ontrack = (event) => {
+                console.log(`Peer Connection track: ${event}`)
+                const videoElement = document.createElement('video');
+                videoElement.srcObject = event.streams[0];
+                videoElement.play();
 
-        dataChannel.onmessage = (event) => {
-            console.log("Received message from server:", event.data);
-        };
+                // Append the video element to the camera grid
+                const cameraGrid = document.getElementById('cameraGrid');
+                const videoContainer = document.createElement('div');
+                videoContainer.className = 'video-container';
+                videoContainer.appendChild(videoElement);
+                cameraGrid.appendChild(videoContainer);
+            };
+            const dataChannel = peerConnection.createDataChannel("control")
+
+            dataChannel.onopen = () => {
+                console.log("Data channel is open!");
+            };
+
+            dataChannel.onmessage = (event) => {
+                console.log("Received message from server:", event.data);
+            };
+
+            const offer = await peerConnection.createOffer();
+            await peerConnection.setLocalDescription(offer);
+
+            socket.send(JSON.stringify({
+                type: "offer",
+                sdp: offer.sdp
+            }))
+        }
+
+        socket.onmessage = async (message) => {
+            const data = JSON.parse(message.data)
+            console.log(`Socket Message: ${JSON.stringify(data)}`)
+            if (data.type === "offer") {
+                await peerConnection.setRemoteDescription(new RTCSessionDescription(data))
+                const answer = await peerConnection.createAnswer();
+                await peerConnection.setLocalDescription(answer)
+                socket.send(JSON.stringify({ type: "answer", sdp: answer.sdp }))
+            } else if (data.type === "answer") {
+                await peerConnection.setRemoteDescription(new RTCSessionDescription(data))
+            } else if (data.type === "candidate") {
+                await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+            }
+        }
+        let deviceStates = {};
+
 
         function toggleControls() {
             const panel = document.getElementById('controlsPanel');
@@ -136,48 +192,6 @@
             var data = JSON.stringify({ "name": ctrl, "value": val });
             xhttp.send(data);
         }
-
-        async function initWebRTC() {
-            // Create offer to send to the server
-            const offer = await peerConnection.createOffer();
-            await peerConnection.setLocalDescription(offer);
-
-            let xhttp = new XMLHttpRequest();
-            xhttp.open("POST", "/offer", true); // Change this URL if needed
-            xhttp.setRequestHeader("Content-Type", "application/json");
-            xhttp.setRequestHeader("Access-Control-Allow-Origin", "*"); // Not needed for requests, but good to be aware
-            xhttp.onreadystatechange = async function () {
-                if (this.readyState === XMLHttpRequest.DONE) {
-                    if (this.status === 200) {
-                        // Handle successful response here
-                        console.log("Offer sent successfully!");
-                        // Handle incoming tracks
-                        peerConnection.ontrack = (event) => {
-                            console.log(`Peer Connection track: ${event}`)
-                            const videoElement = document.createElement('video');
-                            videoElement.srcObject = event.streams[0];
-                            videoElement.play();
-
-                            // Append the video element to the camera grid
-                            const cameraGrid = document.getElementById('cameraGrid');
-                            const videoContainer = document.createElement('div');
-                            videoContainer.className = 'video-container';
-                            videoContainer.appendChild(videoElement);
-                            cameraGrid.appendChild(videoContainer);
-                        };
-                        let response = JSON.parse(this.responseText);
-                        await peerConnection.setRemoteDescription(new RTCSessionDescription(response));
-
-                    } else {
-                        console.error("Error sending offer:", this.statusText);
-                    }
-                }
-            };
-            xhttp.send(JSON.stringify(offer));
-        }
-
-        // Start WebRTC on load
-        window.onload = initWebRTC;
 
         // Initialize Materialize components
         document.addEventListener('DOMContentLoaded', function () {

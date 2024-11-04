@@ -22,6 +22,7 @@ import (
 	"github.com/pion/webrtc/v3/pkg/media"
 	"github.com/vladimirvivien/go4vl/device"
 	"github.com/vladimirvivien/go4vl/v4l2"
+	"golang.org/x/net/websocket"
 )
 
 type CameraDevice struct {
@@ -58,6 +59,20 @@ type PageData struct {
 		ImgHeight   int
 		ControlPath string
 	}
+}
+
+// Define signaling message types
+type SignalingMessage struct {
+	Type      string        `json:"type"` // "offer", "answer", or "candidate"
+	SDP       *string       `json:"sdp,omitempty"`
+	Candidate *ICECandidate `json:"candidate,omitempty"`
+}
+
+// ICECandidate represents an ICE candidate message
+type ICECandidate struct {
+	Candidate     string `json:"candidate"`
+	SDPMid        string `json:"sdpMid,omitempty"`
+	SDPMLineIndex uint16 `json:"sdpMLineIndex,omitempty"`
 }
 
 func (cm *CameraManager) InitCamera(devPath string, width, height int, format string, fps int, bufferSize int) error {
@@ -253,6 +268,105 @@ func (cm *CameraManager) HandleControl(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func wsHandler(ws *websocket.Conn) {
+	defer ws.Close()
+
+	var peerConnection *webrtc.PeerConnection
+	var err error
+
+	// Create a new PeerConnection
+	peerConnection, err = webrtc.NewPeerConnection(webrtc.Configuration{
+		ICEServers: []webrtc.ICEServer{
+			{
+				URLs: []string{"stun:stun.cloudflare.com:3478"},
+			},
+		},
+	})
+	if err != nil {
+		log.Println("Failed to create peer connection:", err)
+		return
+	}
+
+	peerConnection.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
+		log.Printf("Peer Connection State has changed: %s\n", s.String())
+	})
+
+	peerConnection.OnDataChannel(func(d *webrtc.DataChannel) {
+		log.Printf("New DataChannel %s %d\n", d.Label(), d.ID())
+		d.OnOpen(func() {
+			log.Printf("Data channel '%s' open\n", d.Label())
+		})
+		d.OnMessage(func(msg webrtc.DataChannelMessage) {
+			log.Printf("Message from DataChannel '%s': %s\n", d.Label(), msg.Data)
+		})
+	})
+
+	peerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
+		if candidate != nil {
+			log.Printf("Sending ICE candidate: %v\n", candidate.ToJSON())
+			if err := websocket.JSON.Send(ws, candidate.ToJSON()); err != nil {
+				log.Println("Failed to send answer:", err)
+			}
+		}
+	})
+
+	// WebRTC signaling loop
+	for {
+		var msg SignalingMessage
+		if err := websocket.JSON.Receive(ws, &msg); err != nil {
+			log.Println("Failed to read message:", err)
+			break
+		}
+
+		switch msg.Type {
+		case "offer":
+			// Set the remote description first
+			offer := webrtc.SessionDescription{
+				Type: webrtc.SDPTypeOffer,
+				SDP:  *msg.SDP,
+			}
+			if err := peerConnection.SetRemoteDescription(offer); err != nil {
+				log.Println("Failed to set remote description:", err)
+				break
+			}
+
+			// Create answer after setting remote description
+			answer, err := peerConnection.CreateAnswer(nil)
+			if err != nil {
+				log.Println("Failed to create answer:", err)
+				break
+			}
+
+			// Set local description
+			if err := peerConnection.SetLocalDescription(answer); err != nil {
+				log.Println("Failed to set local description:", err)
+				break
+			}
+
+			// Send answer back
+			answerSDP := answer.SDP
+			if err := websocket.JSON.Send(ws, SignalingMessage{Type: "answer", SDP: &answerSDP}); err != nil {
+				log.Println("Failed to send answer:", err)
+			}
+
+		case "candidate":
+			// Add ICE candidate only if the remote description is set
+			if peerConnection.RemoteDescription() != nil && msg.Candidate != nil {
+				candidate := webrtc.ICECandidateInit{
+					Candidate:     msg.Candidate.Candidate,
+					SDPMid:        &msg.Candidate.SDPMid,
+					SDPMLineIndex: &msg.Candidate.SDPMLineIndex,
+				}
+				if err := peerConnection.AddICECandidate(candidate); err != nil {
+					log.Println("Failed to add ICE candidate:", err)
+				}
+			} else {
+				log.Println("Cannot add ICE candidate: remote description is not set")
+			}
+		}
+	}
+}
+
 func main() {
 	var (
 		port     = ":9090"
@@ -312,13 +426,14 @@ func main() {
 		log.Fatal("No cameras were successfully initialized")
 	}
 
-	http.HandleFunc("/webcam", cm.ServePage)
-	http.HandleFunc("/stream/", cm.ServeVideoStream)
-	http.HandleFunc("/control/", cm.HandleControl)
-	http.HandleFunc("/offer", cm.handleOffer)
+	cameraManager := NewCameraManager()
+
+	http.HandleFunc("/", cameraManager.ServePage)
+	http.HandleFunc("/stream/", cameraManager.ServeVideoStream)
+	http.HandleFunc("/control/", cameraManager.HandleControl)
+	http.Handle("/ws", websocket.Handler(wsHandler))
 
 	log.Printf("Starting server on port %s", port)
-	log.Println("Use URL path /webcam")
 	if err := http.ListenAndServe(port, nil); err != nil {
 		log.Fatal(err)
 	}
@@ -343,10 +458,6 @@ func getFormatType(fmtStr string) v4l2.FourCCType {
 }
 
 func (cm *CameraManager) handleOffer(w http.ResponseWriter, r *http.Request) {
-
-	w.Header().Set("Access-Control-Allow-Origin", "*") // Change * to your specific domain for production
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
 	// Decode the incoming WebRTC offer
 	var offer webrtc.SessionDescription
