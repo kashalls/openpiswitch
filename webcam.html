@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1.0" />
+    <title>📸 GoCam</title>
+
+    <!-- CSS  -->
+    <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/materialize/1.0.0/css/materialize.min.css" type="text/css"
+        rel="stylesheet" media="screen,projection" />
+    <style>
+        .camera-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 1rem;
+            padding: 1rem;
+        }
+
+        .video-container {
+            position: relative;
+            width: 100%;
+            height: auto;
+        }
+
+        video {
+            width: 100%;
+            height: auto;
+            display: block;
+        }
+
+        .controls-panel {
+            position: fixed;
+            right: 0;
+            top: 0;
+            height: 100vh;
+            width: 300px;
+            overflow-y: auto;
+            background-color: #263238;
+            transform: translateX(100%);
+            transition: transform 0.3s ease-in-out;
+            z-index: 1000;
+        }
+
+        .controls-panel.active {
+            transform: translateX(0);
+        }
+
+        .controls-toggle {
+            position: fixed;
+            right: 20px;
+            top: 20px;
+            z-index: 1001;
+        }
+    </style>
+</head>
+
+<body class="blue-grey darken-4">
+    <div class="camera-grid" id="cameraGrid">
+        <!-- Video tracks will be inserted here dynamically -->
+    </div>
+
+    <!-- Controls Toggle Button -->
+    <a class="btn-floating btn-large waves-effect waves-light red controls-toggle" onclick="toggleControls()">
+        <i class="material-icons">settings</i>
+    </a>
+
+    <!-- Controls Panel -->
+    <div class="controls-panel" id="controlsPanel">
+        {{range .Cameras}}
+        <div class="container">
+            <h5 class="white-text">{{.ID}} Controls</h5>
+            <div class="card blue-grey darken-1">
+                <div class="card-content white-text hoverable">
+                    <span class="card-title">Brightness</span>
+                    <p class="range-field" style="margin:0px;">
+                        <input type="range" id="brightness-{{.ID}}" min="-64" max="64"
+                            onclick="setCtrl('{{.ID}}', 'brightness', this.value)" />
+                    </p>
+                </div>
+            </div>
+            <div class="card blue-grey darken-1 hoverable">
+                <div class="card-content white-text">
+                    <span class="card-title">Contrast</span>
+                    <p class="range-field">
+                        <input type="range" id="contrast-{{.ID}}" min="0" max="64"
+                            onclick="setCtrl('{{.ID}}', 'contrast', this.value)" />
+                    </p>
+                </div>
+            </div>
+            <div class="card blue-grey darken-1 hoverable">
+                <div class="card-content white-text">
+                    <span class="card-title">Saturation</span>
+                    <p class="range-field">
+                        <input type="range" id="saturation-{{.ID}}" min="0" max="128"
+                            onclick="setCtrl('{{.ID}}', 'saturation', this.value)" />
+                    </p>
+                </div>
+            </div>
+        </div>
+        {{end}}
+    </div>
+
+    <!-- Scripts-->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/materialize/1.0.0/js/materialize.min.js"></script>
+
+    <script>
+        let deviceStates = {};
+        const peerConnection = new RTCPeerConnection({
+            iceServers: [
+                {
+                    urls: "stun:stun.cloudflare.com:3478"
+                }
+            ]
+        });
+        const dataChannel = peerConnection.createDataChannel("control")
+
+        dataChannel.onopen = () => {
+            console.log("Data channel is open!");
+        };
+
+        dataChannel.onmessage = (event) => {
+            console.log("Received message from server:", event.data);
+        };
+
+        function toggleControls() {
+            const panel = document.getElementById('controlsPanel');
+            panel.classList.toggle('active');
+        }
+
+        function setCtrl(deviceId, ctrl, val) {
+            let xhttp = new XMLHttpRequest();
+            xhttp.open("POST", "/control/" + deviceId, true);
+            xhttp.setRequestHeader("Content-Type", "application/json");
+            var data = JSON.stringify({ "name": ctrl, "value": val });
+            xhttp.send(data);
+        }
+
+        async function initWebRTC() {
+            // Create offer to send to the server
+            const offer = await peerConnection.createOffer();
+            await peerConnection.setLocalDescription(offer);
+
+            let xhttp = new XMLHttpRequest();
+            xhttp.open("POST", "/offer", true); // Change this URL if needed
+            xhttp.setRequestHeader("Content-Type", "application/json");
+            xhttp.setRequestHeader("Access-Control-Allow-Origin", "*"); // Not needed for requests, but good to be aware
+            xhttp.onreadystatechange = async function () {
+                if (this.readyState === XMLHttpRequest.DONE) {
+                    if (this.status === 200) {
+                        // Handle successful response here
+                        console.log("Offer sent successfully!");
+                        // Handle incoming tracks
+                        peerConnection.ontrack = (event) => {
+                            console.log(`Peer Connection track: ${event}`)
+                            const videoElement = document.createElement('video');
+                            videoElement.srcObject = event.streams[0];
+                            videoElement.play();
+
+                            // Append the video element to the camera grid
+                            const cameraGrid = document.getElementById('cameraGrid');
+                            const videoContainer = document.createElement('div');
+                            videoContainer.className = 'video-container';
+                            videoContainer.appendChild(videoElement);
+                            cameraGrid.appendChild(videoContainer);
+                        };
+                        let response = JSON.parse(this.responseText);
+                        await peerConnection.setRemoteDescription(new RTCSessionDescription(response));
+
+                    } else {
+                        console.error("Error sending offer:", this.statusText);
+                    }
+                }
+            };
+            xhttp.send(JSON.stringify(offer));
+        }
+
+        // Start WebRTC on load
+        window.onload = initWebRTC;
+
+        // Initialize Materialize components
+        document.addEventListener('DOMContentLoaded', function () {
+            var elems = document.querySelectorAll('.sidenav');
+            var instances = M.Sidenav.init(elems);
+        });
+    </script>
+</body>
+
+</html>
