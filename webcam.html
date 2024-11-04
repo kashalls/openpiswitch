@@ -132,24 +132,24 @@
             }
 
             peerConnection.ontrack = (event) => {
-                console.log(`Peer Connection track: ${event}`)
-                const videoElement = document.createElement('video');
-                videoElement.srcObject = event.streams[0];
-                videoElement.play();
-
-                // Append the video element to the camera grid
-                const cameraGrid = document.getElementById('cameraGrid');
-                const videoContainer = document.createElement('div');
-                videoContainer.className = 'video-container';
-                videoContainer.appendChild(videoElement);
-                cameraGrid.appendChild(videoContainer);
+                console.log(`Peer Connection track: ${JSON.stringify(event)}`)
+                event.streams.forEach((stream) => {
+                    const videoElement = document.createElement(`video#${stream.id}`);
+                    videoElement.srcObject = stream;
+                    videoElement.play();
+    
+                    // Append the video element to the camera grid
+                    const cameraGrid = document.getElementById('cameraGrid');
+                    const videoContainer = document.createElement('div');
+                    videoContainer.className = 'video-container';
+                    videoContainer.appendChild(videoElement);
+                    cameraGrid.appendChild(videoContainer);
+                })
             };
             const dataChannel = peerConnection.createDataChannel("control")
-
             dataChannel.onopen = () => {
                 console.log("Data channel is open!");
             };
-
             dataChannel.onmessage = (event) => {
                 console.log("Received message from server:", event.data);
             };

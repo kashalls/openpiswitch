@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/kashalls/openterface-switch/internal/usb"
-	"github.com/pion/randutil"
 	"github.com/pion/webrtc/v3"
 	"github.com/pion/webrtc/v3/pkg/media"
 	"github.com/vladimirvivien/go4vl/device"
@@ -287,17 +286,28 @@ func wsHandler(ws *websocket.Conn) {
 		return
 	}
 
+	defer func() {
+		if cErr := peerConnection.Close(); cErr != nil {
+			fmt.Printf("cannot close peerConnection: %v\n", cErr)
+		}
+	}()
+
 	peerConnection.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
-		log.Printf("Peer Connection State has changed: %s\n", s.String())
+		fmt.Printf("Peer Connection State has changed: %s\n", s.String())
 	})
 
 	peerConnection.OnDataChannel(func(d *webrtc.DataChannel) {
-		log.Printf("New DataChannel %s %d\n", d.Label(), d.ID())
+		fmt.Printf("New DataChannel %s %d\n", d.Label(), d.ID())
+
+		// Register channel opening handling
 		d.OnOpen(func() {
-			log.Printf("Data channel '%s' open\n", d.Label())
+			fmt.Printf("Data channel '%s'-'%d' open.", d.Label(), d.ID())
+
 		})
+
+		// Register text message handling
 		d.OnMessage(func(msg webrtc.DataChannelMessage) {
-			log.Printf("Message from DataChannel '%s': %s\n", d.Label(), msg.Data)
+			fmt.Printf("Message from DataChannel '%s': '%s'\n", d.Label(), string(msg.Data))
 		})
 	})
 
@@ -309,6 +319,46 @@ func wsHandler(ws *websocket.Conn) {
 			}
 		}
 	})
+
+	// Iterate over the devices and create a video track for each one
+	cm.mu.RLock() // Lock for reading the devices map
+	for deviceID, device := range cm.Devices {
+		log.Printf("Creating New Track %s: %v", deviceID, device)
+		videoTrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{
+			MimeType:  "video/h264", // Change according to your camera's output format
+			ClockRate: 90000,
+		}, "video", deviceID)
+		if err != nil {
+			log.Printf("Failed to create video track for device %s: %v", deviceID, err)
+			cm.mu.RUnlock() // Unlock before returning
+			return
+		}
+
+		// Add the video track to the peer connection
+		rtp, err := peerConnection.AddTrack(videoTrack)
+		log.Printf("Created RTP Sender: %v", rtp)
+		if err != nil {
+			log.Printf("Failed to add video track for device %s: %v", deviceID, err)
+			cm.mu.RUnlock() // Unlock before returning
+			return
+		}
+
+		// Start a goroutine to send frames over the video track for this device
+		go func(device *CameraDevice, videoTrack *webrtc.TrackLocalStaticSample) {
+			for frame := range cm.Devices[deviceID].Broadcast {
+				if len(frame) == 0 {
+					continue
+				}
+				// Create a sample with the frame data
+				sample := media.Sample{Data: frame, Duration: time.Second / time.Duration(cm.Devices[deviceID].FPS)}
+				if err := videoTrack.WriteSample(sample); err != nil {
+					log.Printf("Failed to write sample for device %s: %v", device.ID, err)
+					return
+				}
+			}
+		}(device, videoTrack) // Pass the current device and track to the goroutine
+	}
+	cm.mu.RUnlock() // Unlock after processing all devices
 
 	// WebRTC signaling loop
 	for {
@@ -367,12 +417,16 @@ func wsHandler(ws *websocket.Conn) {
 	}
 }
 
+var (
+	cm = NewCameraManager()
+)
+
 func main() {
 	var (
 		port     = ":9090"
 		format   = "h264"
-		width    = 1920
-		height   = 1080
+		width    = 620
+		height   = 480
 		fps      = 30
 		buffSize = 4
 	)
@@ -396,7 +450,6 @@ func main() {
 	flag.IntVar(&buffSize, "b", buffSize, "device buffer size")
 	flag.Parse()
 
-	cm := NewCameraManager()
 	defer cm.CloseAll()
 
 	for _, paths := range results {
@@ -426,11 +479,9 @@ func main() {
 		log.Fatal("No cameras were successfully initialized")
 	}
 
-	cameraManager := NewCameraManager()
-
-	http.HandleFunc("/", cameraManager.ServePage)
-	http.HandleFunc("/stream/", cameraManager.ServeVideoStream)
-	http.HandleFunc("/control/", cameraManager.HandleControl)
+	http.HandleFunc("/", cm.ServePage)
+	http.HandleFunc("/stream/", cm.ServeVideoStream)
+	http.HandleFunc("/control/", cm.HandleControl)
 	http.Handle("/ws", websocket.Handler(wsHandler))
 
 	log.Printf("Starting server on port %s", port)
@@ -459,137 +510,4 @@ func getFormatType(fmtStr string) v4l2.FourCCType {
 
 func (cm *CameraManager) handleOffer(w http.ResponseWriter, r *http.Request) {
 
-	// Decode the incoming WebRTC offer
-	var offer webrtc.SessionDescription
-	if err := json.NewDecoder(r.Body).Decode(&offer); err != nil {
-		http.Error(w, "Invalid offer", http.StatusBadRequest)
-		return
-	}
-
-	// Create a new peer connection
-	peerConnection, err := webrtc.NewPeerConnection(webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{
-			{
-				URLs: []string{"stun:stun.cloudflare.com:3478"},
-			},
-		},
-	})
-	defer func() {
-		if cErr := peerConnection.Close(); cErr != nil {
-			fmt.Printf("cannot close peerConnection: %v\n", cErr)
-		}
-	}()
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to create peer connection: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	peerConnection.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
-		fmt.Printf("Peer Connection State has changed: %s\n", s.String())
-	})
-
-	// Register data channel creation handling
-	peerConnection.OnDataChannel(func(d *webrtc.DataChannel) {
-		fmt.Printf("New DataChannel %s %d\n", d.Label(), d.ID())
-
-		// Register channel opening handling
-		d.OnOpen(func() {
-			fmt.Printf("Data channel '%s'-'%d' open. Random messages will now be sent to any connected DataChannels every 5 seconds\n", d.Label(), d.ID())
-
-			ticker := time.NewTicker(5 * time.Second)
-			defer ticker.Stop()
-			for range ticker.C {
-				message, sendErr := randutil.GenerateCryptoRandomString(15, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
-				if sendErr != nil {
-					panic(sendErr)
-				}
-
-				// Send the message as text
-				fmt.Printf("Sending '%s'\n", message)
-				if sendErr = d.SendText(message); sendErr != nil {
-					panic(sendErr)
-				}
-			}
-		})
-
-		// Register text message handling
-		d.OnMessage(func(msg webrtc.DataChannelMessage) {
-			fmt.Printf("Message from DataChannel '%s': '%s'\n", d.Label(), string(msg.Data))
-		})
-	})
-
-	// Iterate over the devices and create a video track for each one
-	cm.mu.RLock() // Lock for reading the devices map
-	for deviceID, device := range cm.Devices {
-		videoTrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{
-			MimeType:  "video/h264", // Change according to your camera's output format
-			ClockRate: 90000,
-		}, "video", deviceID)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to create video track for device %s: %v", deviceID, err), http.StatusInternalServerError)
-			cm.mu.RUnlock() // Unlock before returning
-			return
-		}
-
-		// Add the video track to the peer connection
-		_, err = peerConnection.AddTrack(videoTrack)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to add video track for device %s: %v", deviceID, err), http.StatusInternalServerError)
-			cm.mu.RUnlock() // Unlock before returning
-			return
-		}
-
-		// Start a goroutine to send frames over the video track for this device
-		go func(device *CameraDevice, videoTrack *webrtc.TrackLocalStaticSample) {
-			for frame := range device.Broadcast {
-				if len(frame) == 0 {
-					continue
-				}
-
-				// Create a sample with the frame data
-				sample := media.Sample{Data: frame, Duration: time.Second / time.Duration(device.FPS)}
-				if err := videoTrack.WriteSample(sample); err != nil {
-					log.Printf("Failed to write sample for device %s: %v", device.ID, err)
-					return
-				}
-			}
-		}(device, videoTrack) // Pass the current device and track to the goroutine
-	}
-	cm.mu.RUnlock() // Unlock after processing all devices
-
-	// Set remote description from the offer
-	if err := peerConnection.SetRemoteDescription(offer); err != nil {
-		http.Error(w, fmt.Sprintf("Failed to set remote description: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	// Create an answer
-	answer, err := peerConnection.CreateAnswer(nil)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to create answer: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	// Create channel that is blocked until ICE Gathering is complete
-	gatherComplete := webrtc.GatheringCompletePromise(peerConnection)
-
-	// Set local description
-	if err := peerConnection.SetLocalDescription(answer); err != nil {
-		http.Error(w, fmt.Sprintf("Failed to set local description: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	// Block until ICE Gathering is complete, disabling trickle ICE
-	// we do this because we only can exchange one signaling message
-	// in a production application you should exchange ICE Candidates via OnICECandidate
-	<-gatherComplete
-
-	// Send the answer back to the client
-	resp, err := json.Marshal(peerConnection.LocalDescription())
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to encode answer: %v", err), http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.Write(resp)
 }
