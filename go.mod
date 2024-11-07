@@ -4,7 +4,6 @@ go 1.23.2
 
 require (
 	github.com/fatih/color v1.18.0
-	github.com/go-gst/go-gst v1.3.0
 	github.com/google/gousb v1.1.3
 	github.com/pion/webrtc/v4 v4.0.1
 	github.com/rodaine/table v1.3.0
@@ -14,11 +13,9 @@ require (
 )
 
 require (
-	github.com/go-gst/go-glib v1.3.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
-	github.com/mattn/go-pointer v0.0.1 // indirect
 	github.com/pion/datachannel v1.5.9 // indirect
 	github.com/pion/dtls/v3 v3.0.4 // indirect
 	github.com/pion/ice/v4 v4.0.2 // indirect
@@ -36,6 +33,5 @@ require (
 	github.com/pion/turn/v4 v4.0.0 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
 	golang.org/x/crypto v0.28.0 // indirect
-	golang.org/x/exp v0.0.0-20241009180824-f66d83c29e7c // indirect
 	golang.org/x/sys v0.26.0 // indirect
 )

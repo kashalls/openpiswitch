@@ -2,41 +2,42 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"html/template"
 	"log"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/go-gst/go-gst/gst"
-	"github.com/go-gst/go-gst/gst/app"
 	"github.com/kashalls/openterface-switch/internal/table"
 	"github.com/kashalls/openterface-switch/internal/usb"
 	"github.com/pion/webrtc/v4"
-	"github.com/pion/webrtc/v4/pkg/media"
 	"github.com/tarm/serial"
 	"github.com/vladimirvivien/go4vl/device"
+	"github.com/vladimirvivien/go4vl/v4l2"
 	"golang.org/x/net/websocket"
 )
 
 type Openterface struct {
-	ID          string
-	Device      *device.Device
-	SerialPort  *serial.Port
-	Paths       usb.DevicePaths
-	VideoFrames <-chan []byte
-	AudioFrames <-chan []byte
-	VideoTrack  *webrtc.TrackLocalStaticSample
-	AudioTrack  *webrtc.TrackLocalStaticSample
-	Width       int
-	Height      int
-	FPS         int
-	StreamInfo  string
-	ctx         context.Context
-	cancel      context.CancelFunc
+	ID           string
+	Paths        usb.DevicePaths
+	Camera       *device.Device
+	CameraFrames <-chan []byte
+	AudioFrames  <-chan []byte
+	Width        int
+	Height       int
+	FPS          int
+	StreamInfo   string
+	SerialPort   *serial.Port
+	ctx          context.Context
+	cancel       context.CancelFunc
 }
 
 type DeviceManager struct {
@@ -90,11 +91,42 @@ type ICECandidate struct {
 	SDPMLineIndex uint16 `json:"sdpMLineIndex,omitempty"`
 }
 
-func (dm *DeviceManager) InitDevice(paths usb.DevicePaths, fps int, bufferSize int) error {
+func (dm *DeviceManager) InitDevice(paths usb.DevicePaths) error {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 
+	camera, err := device.Open(paths.CameraPath,
+		device.WithIOType(v4l2.IOTypeMMAP),
+		device.WithPixFormat(v4l2.PixFormat{
+			PixelFormat: v4l2.PixelFmtMJPEG,
+			Width:       uint32(width),
+			Height:      uint32(height),
+			Field:       v4l2.FieldAny,
+		}),
+		device.WithFPS(uint32(fps)),
+		device.WithBufferSize(uint32(bufferSize)),
+	)
+	if err != nil {
+		log.Fatalf("failed to open %s: %v", paths.CameraPath, err)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
+	if err := camera.Start(ctx); err != nil {
+		log.Fatalf("failed to capture stream of %s: %v", paths.CameraPath, err)
+	}
+
+	caps := camera.Capability()
+	currentFormat, err := camera.GetPixFormat()
+	if err != nil {
+		cancel()
+		return fmt.Errorf("failed to get format for device %s: %v", paths.CameraPath, err)
+	}
+	streamInfo := fmt.Sprintf("%s - %s [%dx%d] %d fps",
+		caps.Card,
+		v4l2.PixelFormats[currentFormat.PixelFormat],
+		currentFormat.Width, currentFormat.Height, fps,
+	)
+
 	serialPort, err := openSerialPort(paths.SerialPath, 115200) // Set baud rate as needed
 	if err != nil {
 		cancel()
@@ -103,40 +135,18 @@ func (dm *DeviceManager) InitDevice(paths usb.DevicePaths, fps int, bufferSize i
 
 	deviceID := filepath.Base(paths.CameraPath)
 
-	videoId := fmt.Sprintf("video-%s", deviceID)
-	videoTrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8}, "video", deviceID)
-	if err != nil {
-		log.Printf("Failed to create video track for device %s: %v", deviceID, err)
-		cancel()
-		return err
-	}
-	// pipelineForCodec("vp8", videoId, []*webrtc.TrackLocalStaticSample{videoTrack}, "videotestsrc")
-	pipelineForCodec("vp8", videoId, []*webrtc.TrackLocalStaticSample{videoTrack}, fmt.Sprintf("v4l2src device=\"%s\"", paths.CameraPath))
-
-	audioId := fmt.Sprintf("audio-%s", deviceID)
-	audioTrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}, "audio", deviceID)
-	if err != nil {
-		log.Printf("Failed to create audio track for device %s: %v", deviceID, err)
-		cancel()
-		return err
-	}
-	pipelineForCodec("opus", audioId, []*webrtc.TrackLocalStaticSample{audioTrack}, fmt.Sprintf("alsasrc device=\"hw:%s\"", paths.AudioPath[len(paths.AudioPath)-1:]))
-	// pipelineForCodec("opus", audioId, []*webrtc.TrackLocalStaticSample{audioTrack}, "audiotestsrc")
-
 	dm.Devices[deviceID] = &Openterface{
-		ID: deviceID,
-		// Device:      camera,
-		SerialPort: serialPort,
-		// VideoFrames: camera.GetOutput(),
-		VideoTrack: videoTrack,
-		AudioTrack: audioTrack,
-		Paths:      paths,
-		//Width:       int(currFmt.Width),
-		//Height:      int(currFmt.Height),
-		FPS: fps,
-		//StreamInfo:  streamInfo,
-		ctx:    ctx,
-		cancel: cancel,
+		ID:           deviceID,
+		Camera:       camera,
+		SerialPort:   serialPort,
+		CameraFrames: camera.GetOutput(),
+		Paths:        paths,
+		Width:        int(currentFormat.Width),
+		Height:       int(currentFormat.Height),
+		FPS:          fps,
+		StreamInfo:   streamInfo,
+		ctx:          ctx,
+		cancel:       cancel,
 	}
 
 	return nil
@@ -148,7 +158,7 @@ func (dm *DeviceManager) CloseAll() {
 
 	for _, dev := range dm.Devices {
 		dev.cancel()
-		dev.Device.Close()
+		dev.Camera.Close()
 		if dev.SerialPort != nil {
 			dev.SerialPort.Close()
 		}
@@ -201,21 +211,16 @@ func (dm *DeviceManager) ServePage(w http.ResponseWriter, r *http.Request) {
 }
 
 var (
-	dm = NewDeviceManager()
+	dm         = NewDeviceManager()
+	port       = ":9090"
+	width      = 1920
+	height     = 1080
+	fps        = 30
+	bufferSize = 1
 )
 
 func main() {
 	defer dm.CloseAll()
-
-	gst.Init(nil)
-
-	var (
-		port     = ":9090"
-		width    = 1920
-		height   = 1080
-		fps      = 30
-		buffSize = 1
-	)
 
 	results, errors := usb.FindUSBDevices()
 
@@ -232,14 +237,14 @@ func main() {
 	flag.IntVar(&width, "w", width, "capture width")
 	flag.IntVar(&height, "h", height, "capture height")
 	flag.IntVar(&fps, "r", fps, "frames per second")
-	flag.IntVar(&buffSize, "b", buffSize, "device buffer size")
+	flag.IntVar(&bufferSize, "b", bufferSize, "device buffer size")
 	flag.Parse()
 
 	fmt.Printf("Found %d devices:\n", len(results))
 	table.Generate(results)
 
 	for _, paths := range results {
-		if err := dm.InitDevice(paths, fps, buffSize); err != nil {
+		if err := dm.InitDevice(paths); err != nil {
 			log.Printf("Warning: failed to initialize camera %s - %s: %v", paths.CameraPath, paths.SerialPath, err)
 			continue
 		}
@@ -250,11 +255,85 @@ func main() {
 	}
 
 	http.HandleFunc("/", dm.ServePage)
-	http.Handle("/ws", websocket.Handler(websocketHandler))
+	http.HandleFunc("/stream/", dm.ServeVideoStream)
+	http.HandleFunc("/control/", dm.HandleControl)
+	// http.Handle("/ws", websocket.Handler(websocketHandler))
 
 	log.Printf("Starting server on port %s", port)
 	if err := http.ListenAndServe(port, nil); err != nil {
 		log.Fatal(err)
+	}
+}
+
+func (dm *DeviceManager) ServeVideoStream(w http.ResponseWriter, r *http.Request) {
+	deviceID := strings.TrimPrefix(r.URL.Path, "/stream/")
+	dm.mu.RLock()
+	device, exists := dm.Devices[deviceID]
+	dm.mu.RUnlock()
+	if !exists {
+		http.Error(w, "Device not found", http.StatusNotFound)
+		return
+	}
+	mimeWriter := multipart.NewWriter(w)
+	w.Header().Set("Content-Type", fmt.Sprintf("multipart/x-mixed-replace; boundary=%s", mimeWriter.Boundary()))
+	partHeader := make(textproto.MIMEHeader)
+	partHeader.Add("Content-Type", "image/jpeg")
+	for frame := range device.CameraFrames { // Use Broadcast channel
+		if len(frame) == 0 {
+			continue
+		}
+		partWriter, err := mimeWriter.CreatePart(partHeader)
+		if err != nil {
+			log.Printf("failed to create multi-part writer: %s", err)
+			return
+		}
+		if _, err := partWriter.Write(frame); err != nil {
+			log.Printf("failed to write image: %s", err)
+		}
+	}
+}
+
+func (dm *DeviceManager) HandleControl(w http.ResponseWriter, r *http.Request) {
+	deviceID := strings.TrimPrefix(r.URL.Path, "/control/")
+
+	dm.mu.RLock()
+	device, exists := dm.Devices[deviceID]
+	dm.mu.RUnlock()
+
+	if !exists {
+		http.Error(w, "Device not found", http.StatusNotFound)
+		return
+	}
+
+	var ctrl struct {
+		Name  string
+		Value string
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&ctrl); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	val, err := strconv.Atoi(ctrl.Value)
+	if err != nil {
+		http.Error(w, "Invalid control value", http.StatusBadRequest)
+		return
+	}
+
+	switch ctrl.Name {
+	case "brightness":
+		if err := device.Camera.SetControlBrightness(int32(val)); err != nil {
+			http.Error(w, "Failed to set brightness", http.StatusInternalServerError)
+		}
+	case "contrast":
+		if err := device.Camera.SetControlContrast(int32(val)); err != nil {
+			http.Error(w, "Failed to set contrast", http.StatusInternalServerError)
+		}
+	case "saturation":
+		if err := device.Camera.SetControlSaturation(int32(val)); err != nil {
+			http.Error(w, "Failed to set saturation", http.StatusInternalServerError)
+		}
 	}
 }
 
@@ -274,11 +353,6 @@ func websocketHandler(ws *websocket.Conn) {
 		return
 	}
 
-	for _, dev := range dm.Devices {
-		peerConnection.AddTrack(dev.VideoTrack)
-		peerConnection.AddTrack(dev.AudioTrack)
-	}
-
 	defer func() {
 		if cErr := peerConnection.Close(); cErr != nil {
 			fmt.Printf("cannot close peerConnection: %v\n", cErr)
@@ -287,17 +361,6 @@ func websocketHandler(ws *websocket.Conn) {
 
 	peerConnection.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
 		fmt.Printf("Peer Connection State has changed: %s\n", s.String())
-	})
-
-	peerConnection.OnDataChannel(func(d *webrtc.DataChannel) {
-		d.OnOpen(func() {
-			fmt.Printf("[Data Channel Create] %s-%d ", d.Label(), d.ID())
-
-		})
-
-		d.OnMessage(func(msg webrtc.DataChannelMessage) {
-			fmt.Printf("[Data Channel Message] '%s': '%s'\n", d.Label(), string(msg.Data))
-		})
 	})
 
 	peerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
@@ -353,7 +416,6 @@ func websocketHandler(ws *websocket.Conn) {
 			if err := websocket.JSON.Send(ws, answer); err != nil {
 				log.Println("Failed to send answer:", err)
 			}
-			log.Printf("Checking:\n%v\n", peerConnection.CurrentLocalDescription())
 
 		case "candidate":
 			// Add ICE candidate only if the remote description is set
@@ -373,55 +435,4 @@ func websocketHandler(ws *websocket.Conn) {
 			log.Printf("Dunno: %v", msg)
 		}
 	}
-}
-
-func pipelineForCodec(codecName string, trackName string, tracks []*webrtc.TrackLocalStaticSample, pipelineSrc string) {
-	pipelineStr := fmt.Sprintf("appsink name=%s", trackName)
-	switch codecName {
-	case "vp8":
-		pipelineStr = pipelineSrc + " ! video/x-raw, width=1920, height=1080, framerate=30/1 ! vp8enc error-resilient=partitions keyframe-max-dist=10 auto-alt-ref=true cpu-used=5 deadline=1 ! " + pipelineStr
-	case "opus":
-		pipelineStr = pipelineSrc + " ! opusenc ! " + pipelineStr
-	default:
-		panic("Unhandled codec " + codecName) //nolint
-	}
-
-	pipeline, err := gst.NewPipelineFromString(pipelineStr)
-	if err != nil {
-		panic(err)
-	}
-
-	if err = pipeline.SetState(gst.StatePlaying); err != nil {
-		panic(err)
-	}
-
-	appSink, err := pipeline.GetElementByName(trackName)
-	if err != nil {
-		panic(err)
-	}
-
-	app.SinkFromElement(appSink).SetCallbacks(&app.SinkCallbacks{
-		NewSampleFunc: func(sink *app.Sink) gst.FlowReturn {
-			sample := sink.PullSample()
-			if sample == nil {
-				return gst.FlowEOS
-			}
-
-			buffer := sample.GetBuffer()
-			if buffer == nil {
-				return gst.FlowError
-			}
-
-			samples := buffer.Map(gst.MapRead).Bytes()
-			defer buffer.Unmap()
-
-			for _, t := range tracks {
-				if err := t.WriteSample(media.Sample{Data: samples, Duration: *buffer.Duration().AsDuration()}); err != nil {
-					panic(err) //nolint
-				}
-			}
-
-			return gst.FlowOK
-		},
-	})
 }

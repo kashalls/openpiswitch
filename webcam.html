@@ -58,7 +58,17 @@
 
 <body class="blue-grey darken-4">
     <div class="camera-grid" id="cameraGrid">
-        <!-- Video tracks will be inserted here dynamically -->
+        {{range .Cameras}}
+        <div class="card">
+            <div class="card-image">
+                <img src="{{.StreamPath}}" alt="Camera {{.ID}}" />
+            </div>
+            <div class="card-content">
+                <span class="card-title">{{.StreamInfo}}</span>
+                <p>Device: {{.ID}}</p>
+            </div>
+        </div>
+        {{end}}
     </div>
 
     <!-- Controls Toggle Button -->
@@ -106,81 +116,7 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/materialize/1.0.0/js/materialize.min.js"></script>
 
     <script>
-        const socket = new WebSocket("/ws")
-        let peerConnection;
-        let offer;
-        socket.onopen = async () => {
-            console.log("Connected to signaling server")
-
-            peerConnection = new RTCPeerConnection({
-                iceServers: [
-                    {
-                        urls: "stun:stun.cloudflare.com:3478"
-                    }
-                ]
-            });
-            peerConnection.onicecandidate = event => {
-                if (event.candidate) {
-                    socket.send(JSON.stringify({
-                        type: "candidate",
-                        candidate: event.candidate
-                    }))
-                }
-            }
-            peerConnection.oniceconnectionstatechange = event => {
-                console.log(event)
-            }
-            peerConnection.ontrack = (event) => {
-                console.log(`Peer Connection Track: ${event.streams.length} ${JSON.stringify(event.streams[0])} ${JSON.stringify(event.transceiver)} `)
-
-                event.streams.forEach((stream) => {
-                        if (!stream) return
-                        const videoElement = document.createElement('video');
-                        videoElement.style = "background: #000;"
-                        videoElement.srcObject = stream;
-                        videoElement.id = stream.id;
-                        videoElement.defaultMuted = true;
-                        videoElement.autoplay = true;
-                        videoElement.controls = true;
-                        videoElement.play();
-        
-                        // Append the video element to the camera grid
-                        const cameraGrid = document.getElementById('cameraGrid');
-                        const videoContainer = document.createElement('div');
-                        videoContainer.className = 'video-container';
-                        videoContainer.appendChild(videoElement);
-                        cameraGrid.appendChild(videoContainer);
-                })
-            };
-
-            socket.send(JSON.stringify({ type: "query" }))
-        }
-
-        socket.onmessage = async (message) => {
-            const data = JSON.parse(message.data)
-            console.log(`Socket Message: ${JSON.stringify(data)}`)
-            if (data.type === "offer") {
-                await peerConnection.setRemoteDescription(new RTCSessionDescription(data))
-                const answer = await peerConnection.createAnswer();
-                await peerConnection.setLocalDescription(answer)
-                socket.send(JSON.stringify(answer))
-            } else if (data.type === "answer") {
-                await peerConnection.setRemoteDescription(new RTCSessionDescription(data))
-            } else if (data.type === "candidate") {
-                await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
-            } else if (data.type === "query") {
-                for (let i = 0; i < data.count; i++) {
-                    peerConnection.addTransceiver('video', { direction: 'recvonly' });
-                    peerConnection.addTransceiver('audio', { direction: 'recvonly' });
-                }
-
-                offer = await peerConnection.createOffer();
-                await peerConnection.setLocalDescription(offer);
-                socket.send(JSON.stringify(offer))
-            }
-        }
         let deviceStates = {};
-
 
         function toggleControls() {
             const panel = document.getElementById('controlsPanel');
