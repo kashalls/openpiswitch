@@ -108,6 +108,7 @@
     <script>
         const socket = new WebSocket("/ws")
         let peerConnection;
+        let offer;
         socket.onopen = async () => {
             console.log("Connected to signaling server")
 
@@ -119,7 +120,6 @@
                 ]
             });
             peerConnection.onicecandidate = event => {
-                console.log(`Ice Candidate: ${JSON.stringify(event.candidate)}`)
                 if (event.candidate) {
                     socket.send(JSON.stringify({
                         type: "candidate",
@@ -130,37 +130,30 @@
             peerConnection.oniceconnectionstatechange = event => {
                 console.log(event)
             }
-
             peerConnection.ontrack = (event) => {
-                console.log(`Peer Connection track: ${JSON.stringify(event)}`)
+                console.log(`Peer Connection Track: ${event.streams.length} ${JSON.stringify(event.streams[0])} ${JSON.stringify(event.transceiver)} `)
+
                 event.streams.forEach((stream) => {
-                    const videoElement = document.createElement(`video#${stream.id}`);
-                    videoElement.srcObject = stream;
-                    videoElement.play();
-    
-                    // Append the video element to the camera grid
-                    const cameraGrid = document.getElementById('cameraGrid');
-                    const videoContainer = document.createElement('div');
-                    videoContainer.className = 'video-container';
-                    videoContainer.appendChild(videoElement);
-                    cameraGrid.appendChild(videoContainer);
+                        if (!stream) return
+                        const videoElement = document.createElement('video');
+                        videoElement.style = "background: #000;"
+                        videoElement.srcObject = stream;
+                        videoElement.id = stream.id;
+                        videoElement.defaultMuted = true;
+                        videoElement.autoplay = true;
+                        videoElement.controls = true;
+                        videoElement.play();
+        
+                        // Append the video element to the camera grid
+                        const cameraGrid = document.getElementById('cameraGrid');
+                        const videoContainer = document.createElement('div');
+                        videoContainer.className = 'video-container';
+                        videoContainer.appendChild(videoElement);
+                        cameraGrid.appendChild(videoContainer);
                 })
             };
-            const dataChannel = peerConnection.createDataChannel("control")
-            dataChannel.onopen = () => {
-                console.log("Data channel is open!");
-            };
-            dataChannel.onmessage = (event) => {
-                console.log("Received message from server:", event.data);
-            };
 
-            const offer = await peerConnection.createOffer();
-            await peerConnection.setLocalDescription(offer);
-
-            socket.send(JSON.stringify({
-                type: "offer",
-                sdp: offer.sdp
-            }))
+            socket.send(JSON.stringify({ type: "query" }))
         }
 
         socket.onmessage = async (message) => {
@@ -170,11 +163,20 @@
                 await peerConnection.setRemoteDescription(new RTCSessionDescription(data))
                 const answer = await peerConnection.createAnswer();
                 await peerConnection.setLocalDescription(answer)
-                socket.send(JSON.stringify({ type: "answer", sdp: answer.sdp }))
+                socket.send(JSON.stringify(answer))
             } else if (data.type === "answer") {
                 await peerConnection.setRemoteDescription(new RTCSessionDescription(data))
             } else if (data.type === "candidate") {
                 await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+            } else if (data.type === "query") {
+                for (let i = 0; i < data.count; i++) {
+                    peerConnection.addTransceiver('video', { direction: 'recvonly' });
+                    peerConnection.addTransceiver('audio', { direction: 'recvonly' });
+                }
+
+                offer = await peerConnection.createOffer();
+                await peerConnection.setLocalDescription(offer);
+                socket.send(JSON.stringify(offer))
             }
         }
         let deviceStates = {};

@@ -12,9 +12,12 @@ import (
 )
 
 type DevicePaths struct {
-	Hub    *gousb.Device
-	Camera *gousb.Device
-	Serial *gousb.Device
+	HubDevice    *gousb.Device
+	CameraDevice *gousb.Device
+	CameraPath   string
+	SerialDevice *gousb.Device
+	SerialPath   string
+	AudioPath    string
 }
 
 // Error types for different failure scenarios
@@ -34,26 +37,22 @@ func isChildDevice(hub, device *gousb.Device) bool {
 		return false
 	}
 
-	hubPath := hub.Desc.Path
-	devicePath := device.Desc.Path
-
-	// The device path should be longer than the hub path
-	if len(devicePath) <= len(hubPath) {
+	// Compare the bus to check if the device is connected to the same hub
+	if hub.Desc.Bus != device.Desc.Bus {
 		return false
 	}
 
-	// Check if the device's path starts with the hub's path
-	// This indicates the device is connected through this hub
-	for i := range hubPath {
-		if i >= len(devicePath) || hubPath[i] != devicePath[i] {
-			return false
-		}
+	// On the same bus, check if the device's parent path has the hub's path as a prefix
+	hubPath := hub.Desc.Path
+	devicePath := device.Desc.Path
+	if len(devicePath) > len(hubPath) && strings.HasPrefix(JoinIntsToString(devicePath), JoinIntsToString(hubPath)) {
+		return true
 	}
 
-	return true
+	return false
 }
 
-func FindUSBDevicePairs() ([]DevicePaths, []error) {
+func FindUSBDevices() ([]DevicePaths, []error) {
 	// Initialize USB context
 	ctx := gousb.NewContext()
 	//ctx.Debug(4)
@@ -102,8 +101,6 @@ func FindUSBDevicePairs() ([]DevicePaths, []error) {
 		}
 
 		hubPath := device.String()
-		log.Printf("Processing hub: %s (Path: %v)", hubPath, device.Desc.Path)
-
 		// Try to process this hub and its devices
 		devicePaths, err := processHub(device, devices, CameraVendorID, CameraProductID, SerialVendorID, SerialProductID)
 		if err != nil {
@@ -164,25 +161,41 @@ func processHub(hub *gousb.Device, allDevices []*gousb.Device,
 		if otherDevice.Desc.Vendor == gousb.ID(cameraVID) &&
 			otherDevice.Desc.Product == gousb.ID(cameraPID) {
 			cameraDevice = otherDevice
-			log.Printf("Found camera device on hub %s: %s (Path: %v)",
-				hubPath, otherDevice.String(), otherDevice.Desc.Path)
 		}
 
 		// Check if device is a serial device
 		if otherDevice.Desc.Vendor == gousb.ID(serialVID) &&
 			otherDevice.Desc.Product == gousb.ID(serialPID) {
 			serialDevice = otherDevice
-			log.Printf("Found serial device on hub %s: %s (Path: %v)",
-				hubPath, otherDevice.String(), otherDevice.Desc.Path)
 		}
 	}
 
 	// Only return a result if both devices were found on this specific hub
 	if cameraDevice != nil && serialDevice != nil {
+		cameraPath, err := DoJankThingsToTheSysBus("/sys/class/video4linux", "video", "usb", strconv.Itoa(cameraDevice.Desc.Bus), JoinIntsToString(cameraDevice.Desc.Path), "/dev")
+		if err != nil {
+			log.Printf("Failed to find device: %v", err)
+		}
+
+		serialPath, err := DoJankThingsToTheSysBus("/sys/class/tty", "ttyUSB", "usb", strconv.Itoa(serialDevice.Desc.Bus), JoinIntsToString(serialDevice.Desc.Path), "/dev")
+		if err != nil {
+			log.Printf("Failed to find serial for device: %v", err)
+		}
+
+		audioPath, err := DoJankThingsToTheSysBus("/sys/class/sound", "card", "sound", strconv.Itoa(cameraDevice.Desc.Bus), JoinIntsToString(cameraDevice.Desc.Path), "/dev/snd")
+		if err != nil {
+			log.Printf("Failed to find audio for device: %v", err)
+		}
+
+		log.Printf("%s", audioPath)
+
 		return &DevicePaths{
-			Hub:    hub,
-			Camera: cameraDevice,
-			Serial: serialDevice,
+			HubDevice:    hub,
+			CameraDevice: cameraDevice,
+			CameraPath:   cameraPath,
+			SerialDevice: serialDevice,
+			SerialPath:   serialPath,
+			AudioPath:    audioPath,
 		}, nil
 	}
 
@@ -201,78 +214,31 @@ func tryReadDevice(device *gousb.Device) error {
 	}
 	defer config.Close()
 
-	// Try to read some basic device information
-	manufacturer, err := device.Manufacturer()
-	if err != nil {
-		return fmt.Errorf("failed to read manufacturer: %v", err)
-	}
-
-	product, err := device.Product()
-	if err != nil {
-		return fmt.Errorf("failed to read product: %v", err)
-	}
-
-	log.Printf("Successfully read device: %s - %s (Path: %v)",
-		manufacturer, product, device.Desc.Path)
 	return nil
 }
 
-func extractUsbInfo(devicePath string) (bus, addr, usbPath string) {
+func extractUsbInfo(devicePath string) (bus, usbPath string) {
 	// Split path by '/' and search for "usbX/Y-..." format
 	segments := strings.Split(devicePath, "/")
+
 	for i, segment := range segments {
 		if strings.HasPrefix(segment, "usb") && i+1 < len(segments) {
-			bus = segment[3:]                              // Extract bus number from "usbX"
-			addr = segments[i+1]                           // Next segment is the address (e.g., "Y")
-			usbPath = strings.Split(segments[i+3], "-")[1] // Combine to form "usbX/Y"
+			bus = segment[3:] // Extract bus number from "usbX"
+
+			// Start collecting USB path parts
+			for j := i + 1; j < len(segments); j++ {
+				if strings.Contains(segments[j], "-") && !strings.Contains(segments[j], ":") {
+					// Extract the portion after the hyphen and add it to usbPathParts
+					usbPath = strings.Split(segments[j], "-")[1]
+				} else {
+					// Stop if segment doesn't match USB path format or contains a colon
+					break
+				}
+			}
 			break
 		}
 	}
 	return
-}
-
-// findV4L2Camera searches for a V4L2 camera device matching the given USB bus, address, and path.
-func FindV4L2Camera(targetBus, targetAddr, targetPath string) (string, error) {
-	// Directory containing video device links in sysfs
-	v4l2Dir := "/sys/class/video4linux"
-
-	var matchedDevice string
-	err := filepath.Walk(v4l2Dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		// Look for `video*` device directories
-		if !info.IsDir() && strings.HasPrefix(info.Name(), "video") {
-
-			// Resolve the symlink in `device` to find USB device path
-			realPath, err := filepath.EvalSymlinks(path)
-			if err != nil {
-				return err
-			}
-
-			// Check if the path contains "usb" indicating it's a USB device
-			if strings.Contains(realPath, "usb") {
-				// Extract bus, addr, and path from the symlink path
-				bus, _, usbPath := extractUsbInfo(realPath)
-		
-				// Match with target bus, addr, and path
-				if bus == targetBus && usbPath == targetPath {
-					matchedDevice = filepath.Join("/dev", filepath.Base(path))
-					return filepath.SkipDir // Stop once we find the matching device
-				}
-			}
-		}
-		return nil
-	})
-
-	if err != nil {
-		return "", fmt.Errorf("error walking through video devices: %v", err)
-	}
-	if matchedDevice == "" {
-		return "", fmt.Errorf("no matching camera found")
-	}
-	return matchedDevice, nil
 }
 
 func JoinIntsToString(nums []int) string {
@@ -281,6 +247,48 @@ func JoinIntsToString(nums []int) string {
 	for i, num := range nums {
 		strNums[i] = strconv.Itoa(num)
 	}
-	// Join with "."
 	return strings.Join(strNums, ".")
+}
+
+func DoJankThingsToTheSysBus(directory, filter, symlinkFilter, targetBus, targetPath string, resultPathPrefix string) (string, error) {
+	var matched string
+
+	err := filepath.Walk(directory, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if info.IsDir() || !strings.HasPrefix(info.Name(), filter) {
+			return nil
+		}
+
+		realPath, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			return err
+		}
+
+		if !strings.Contains(realPath, symlinkFilter) && !strings.HasSuffix(realPath, "c") {
+			return nil
+		}
+
+		bus, usbPath := extractUsbInfo(realPath)
+
+		if bus == "" || usbPath == "" {
+			return nil
+		}
+
+		if bus == targetBus && usbPath == targetPath {
+			matched = filepath.Join(resultPathPrefix, filepath.Base(path))
+			return filepath.SkipDir
+		}
+		return nil
+	})
+
+	if err != nil {
+		return "", fmt.Errorf("error walking through devices: %v", err)
+	}
+	if matched == "" {
+		return "", fmt.Errorf("no matching device found")
+	}
+	return matched, nil
 }
